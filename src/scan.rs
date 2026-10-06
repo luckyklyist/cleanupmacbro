@@ -69,6 +69,8 @@ pub struct Item {
     pub safe: bool,
     /// Unix seconds of the last time this (or, for dev folders, its project) was touched. 0 = unknown.
     pub last_used: u64,
+    /// For duplicates: the identical copy that is kept.
+    pub dup_of: Option<PathBuf>,
 }
 
 impl Item {
@@ -157,7 +159,7 @@ pub fn dir_size(p: &Path) -> u64 {
 
 fn item(cat: Cat, path: PathBuf, label: impl Into<String>, size: u64) -> Item {
     let last_used = touched(&path);
-    Item { cat, path, label: label.into(), size, selected: false, safe: false, last_used }
+    Item { cat, path, label: label.into(), size, selected: false, safe: false, last_used, dup_of: None }
 }
 
 fn name_of(p: &Path) -> String {
@@ -405,12 +407,13 @@ fn scan_files(tx: Sender<Msg>) {
     let groups = find_duplicates(dup_candidates.into_inner().unwrap_or_default());
     let mut items = Vec::new();
     for group in groups {
-        // Keep the oldest copy, offer the rest.
+        // Keep the first (original-looking, oldest) copy, offer the rest.
         let original = &group[0];
         for copy in &group[1..] {
             let size = fs::metadata(copy).map(|m| on_disk(&m)).unwrap_or(0);
-            let label = format!("{} · same as {}", name_of(copy), original.strip_prefix(&h).unwrap_or(original).display());
-            items.push(item(Cat::Duplicates, copy.clone(), label, size));
+            let mut it = item(Cat::Duplicates, copy.clone(), name_of(copy), size);
+            it.dup_of = Some(original.clone());
+            items.push(it);
         }
     }
     if !items.is_empty() {
@@ -485,7 +488,8 @@ fn walk(root: &Path, h: &Path, skip: &HashSet<PathBuf>, files: &AtomicU64, dups:
         let size = on_disk(&m);
         let ext = path.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
 
-        if m.len() >= MB {
+        // Files under hidden folders (~/.bun, ~/.local/bin, caches) belong to tools; never offer them as duplicates.
+        if m.len() >= MB && !path.strip_prefix(h).unwrap_or(path).components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
             local_dups.push((m.len(), path.to_path_buf()));
         }
         if is_recording(&name) {
@@ -534,7 +538,8 @@ fn hash_file(path: &Path, limit: Option<u64>) -> Option<u64> {
 }
 
 /// Groups byte-identical files: same size → same first 64 KB → same full hash.
-/// Each group is sorted oldest first. Hard links of one file are not duplicates.
+/// Each group is sorted keep-first: names that don't look like copies, then oldest, then shortest path.
+/// Hard links of one file are not duplicates.
 pub fn find_duplicates(mut files: Vec<(u64, PathBuf)>) -> Vec<Vec<PathBuf>> {
     use std::collections::HashMap;
     files.sort();
@@ -562,12 +567,25 @@ pub fn find_duplicates(mut files: Vec<(u64, PathBuf)>) -> Vec<Vec<PathBuf>> {
                 }
             }
             for (_, mut g) in by_full.into_iter().filter(|(_, v)| v.len() > 1) {
-                g.sort_by_key(|p| fs::metadata(p).map(|m| m.mtime()).unwrap_or(i64::MAX));
+                g.sort_by_key(|p| {
+                    (looks_like_copy(p), fs::metadata(p).map(|m| m.mtime()).unwrap_or(i64::MAX), p.as_os_str().len())
+                });
                 groups.push(g);
             }
         }
     }
     groups
+}
+
+/// "x copy.pdf", "x copy 2.pdf", "x (1).zip", or anything inside a "… copy" folder.
+fn looks_like_copy(p: &Path) -> bool {
+    p.iter().any(|c| {
+        let c = c.to_string_lossy().to_lowercase();
+        let stem = c.rsplit_once('.').map_or(c.as_str(), |(s, _)| s).trim_end();
+        stem.ends_with(" copy")
+            || stem.contains(" copy ")
+            || stem.strip_suffix(')').and_then(|s| s.rsplit_once(" (")).is_some_and(|(_, n)| n.parse::<u32>().is_ok())
+    })
 }
 
 fn is_game(app: &Path) -> bool {
@@ -648,6 +666,21 @@ pub fn history() -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// Paths that are never offered for removal from the Disk Map, Find or the Cleanup list:
+/// the system, top-level folders, volume roots, home folders and the core ~/Library folders.
+pub fn protected(p: &Path) -> bool {
+    let h = home();
+    let keep = ["Library", "Library/Application Support", "Library/Containers", "Library/Group Containers", "Library/Preferences", "Library/Mobile Documents"];
+    let system = ["/System", "/bin", "/sbin", "/usr", "/private", "/etc", "/var", "/tmp", "/dev", "/Library", "/cores"];
+    let top = |x: &Path| [Path::new("/"), Path::new("/Volumes"), Path::new("/Users")].contains(&x);
+    !p.is_absolute()
+        || p == h
+        || p.parent().map_or(true, top)
+        || (system.iter().any(|s| p.starts_with(s)) && !p.starts_with("/usr/local"))
+        || keep.iter().any(|k| p == h.join(k))
+        || p.starts_with(h.join("Library/Application Support/CleanYou"))
+}
+
 pub fn unique(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     let mut p = dir.join(format!("{stem}.{ext}"));
     let mut n = 2;
@@ -710,5 +743,15 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2, "a + b; c differs, the hard link isn't a copy");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn spots_copies() {
+        for p in ["a/x copy.pdf", "a/x copy 2.pdf", "a/x (1).zip", "Downloads/Project Assignment 2 copy/f.bin"] {
+            assert!(looks_like_copy(Path::new(p)), "{p}");
+        }
+        for p in ["Downloads/Project Assignment 2/f.bin", "a/IELTS 19 Audio.zip", "a/notes (draft).txt"] {
+            assert!(!looks_like_copy(Path::new(p)), "{p}");
+        }
     }
 }

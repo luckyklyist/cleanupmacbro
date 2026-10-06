@@ -2,7 +2,12 @@ mod agent;
 mod battery;
 mod care;
 mod diskmap;
+mod find;
+mod inspect;
+mod onboard;
+mod photos;
 mod privacy;
+mod review;
 mod startup;
 mod tray;
 mod uninstall;
@@ -10,6 +15,8 @@ mod scan;
 mod smc;
 mod system;
 mod thumbs;
+mod updates;
+mod usage;
 mod video;
 
 use eframe::egui::{
@@ -66,6 +73,8 @@ fn cat_color(c: Cat) -> Color32 {
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Dashboard,
+    Find,
+    Review,
     Cat(Cat),
     Video,
     Speed,
@@ -141,6 +150,22 @@ struct App {
     jobs: Arc<Mutex<Vec<Job>>>,
     encoding: Arc<Mutex<bool>>,
     opts: Opts,
+    /// Compress page shows photos instead of videos.
+    photos_tab: bool,
+    photo_jobs: Arc<Mutex<Vec<photos::Job>>>,
+    photo_busy: Arc<Mutex<bool>>,
+    photo_opts: photos::Opts,
+    find: find::State,
+    /// The Cleanup list: things set aside to review before they go to the Trash.
+    staged: Vec<review::Staged>,
+    usage: usage::History,
+    updates: Option<Arc<Mutex<updates::Progress>>>,
+    /// Listening ports (None until the first look).
+    ports: Arc<Mutex<Option<Vec<system::Port>>>>,
+    ports_at: Option<Instant>,
+    /// First-launch welcome tour (None once finished).
+    onboarding: Option<onboard::State>,
+    self_update: Option<Arc<Mutex<updates::SelfUpdate>>>,
 }
 
 fn matches(it: &Item, cat: Cat, min_large: u64, q: &str) -> bool {
@@ -198,6 +223,18 @@ impl App {
             jobs: Arc::new(Mutex::new(Vec::new())),
             encoding: Arc::new(Mutex::new(false)),
             opts: Opts { quality: Quality::Balanced, downscale: false, replace: false },
+            photos_tab: false,
+            photo_jobs: Arc::new(Mutex::new(Vec::new())),
+            photo_busy: Arc::new(Mutex::new(false)),
+            photo_opts: photos::Opts { quality: Quality::Balanced, format: photos::Format::Heic, replace: false },
+            find: Default::default(),
+            staged: review::load(),
+            usage: usage::History::start(),
+            updates: None,
+            ports: Arc::new(Mutex::new(None)),
+            ports_at: None,
+            onboarding: onboard::needed().then(Default::default),
+            self_update: None,
         }
     }
 
@@ -236,7 +273,18 @@ impl App {
         if idx.is_empty() {
             return;
         }
-        let entries = idx.iter().map(|i| (self.items[*i].path.clone(), self.items[*i].label.clone(), self.items[*i].size)).collect();
+        let going: HashSet<&PathBuf> = idx.iter().map(|i| &self.items[*i].path).collect();
+        let safe = |it: &Item| it.dup_of.as_ref().map_or(true, |o| o.exists() && !going.contains(o));
+        let skipped = idx.iter().filter(|i| !safe(&self.items[**i])).count();
+        let entries: Vec<_> = idx
+            .iter()
+            .map(|i| &self.items[*i])
+            .filter(|it| safe(it))
+            .map(|it| (it.path.clone(), it.label.clone(), it.size))
+            .collect();
+        if skipped > 0 {
+            self.toast(format!("Kept {skipped} file(s): their other copy is gone, so they're no longer duplicates"), false);
+        }
         self.ask_delete_paths(title, entries, permanent);
     }
 
@@ -296,6 +344,15 @@ impl App {
         }
         let extra = if failed > 0 { format!(", {failed} couldn't be moved") } else { String::new() };
         self.toast(format!("Moved {moved} recordings to Movies › Screen Recordings{extra}"), failed == 0);
+    }
+
+    fn add_photos(&mut self, paths: Vec<PathBuf>) {
+        let mut jobs = self.photo_jobs.lock().unwrap();
+        for p in paths {
+            if !jobs.iter().any(|j| j.path == p) {
+                jobs.push(photos::new_job(p));
+            }
+        }
     }
 
     fn add_videos(&mut self, paths: Vec<PathBuf>) {
@@ -359,6 +416,44 @@ impl App {
                 }
             }
         }
+    }
+}
+
+impl App {
+    /// Sidebar footer: the version, and a button that checks GitHub for a newer release.
+    fn version_row(&mut self, ui: &mut Ui) {
+        let state = self.self_update.as_ref().map(|s| s.lock().unwrap().clone());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("v{}", updates::VERSION)).small().color(DIM));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                use updates::SelfUpdate::*;
+                match state {
+                    Some(Available(v, url)) => {
+                        if primary(ui, true, format!("{}  Update to v{v}", ic::ARROW_CIRCLE_UP), SUCCESS).clicked() {
+                            system::open(&url);
+                        }
+                    }
+                    Some(Checking) => {
+                        ui.add(egui::Spinner::new().size(12.0).color(DIM));
+                    }
+                    other => {
+                        let text = match other {
+                            Some(UpToDate) => format!("{} Up to date", ic::CHECK),
+                            Some(Failed) => format!("{} Retry", ic::ARROW_CLOCKWISE),
+                            _ => "Check for updates".into(),
+                        };
+                        if ui.small_button(text).on_hover_text("Asks GitHub for the latest Clean You release").clicked() {
+                            let s = Arc::new(Mutex::new(updates::SelfUpdate::Checking));
+                            updates::check_self(s.clone(), ui.ctx().clone());
+                            self.self_update = Some(s);
+                        }
+                    }
+                }
+                if ui.small_button(ic::INFO).on_hover_text("Welcome tour").clicked() {
+                    self.onboarding = Some(Default::default());
+                }
+            });
+        });
     }
 }
 
@@ -601,6 +696,25 @@ fn short(p: &std::path::Path) -> String {
     })
 }
 
+/// Which identical copy stays: "Keeps “a.zip” here" or "Keeps the one in “Project”".
+fn kept_note(copy: &std::path::Path, orig: &std::path::Path) -> String {
+    let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (cp, op) = (copy.parent().unwrap_or(copy), orig.parent().unwrap_or(orig));
+    if cp == op {
+        return format!("Keeps “{}” here", name(orig));
+    }
+    let a: Vec<_> = cp.iter().collect();
+    let b: Vec<_> = op.iter().collect();
+    let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let differs: Vec<_> = b[pre..b.len() - suf].iter().map(|c| c.to_string_lossy()).collect();
+    if name(copy) == name(orig) && !differs.is_empty() && differs.len() <= 2 {
+        format!("Keeps the one in “{}”", differs.join("/"))
+    } else {
+        format!("Keeps {}", short(orig))
+    }
+}
+
 /// "today", "3 days ago", "5 months ago", "2 years ago".
 fn ago(days: u64) -> String {
     match days {
@@ -719,9 +833,23 @@ fn item_row(ui: &mut Ui, it: &mut Item, busy: bool, show_check: bool, thumbs: &m
     // Name and path.
     let w = right - x - 8.0;
     let title = truncated(ui, &disp(&it.label), 14.0, Color32::WHITE, w);
-    let sub = truncated(ui, &short(&it.path), 11.5, DIM, w);
     ui.painter().galley(pos2(x, cy - title.size().y - 1.0), title, Color32::WHITE);
-    ui.painter().galley(pos2(x, cy + 2.0), sub, DIM);
+    if let Some(orig) = &it.dup_of {
+        // "~/Downloads/Project copy/…   ✓ Keeps the one in “Project”"
+        let keep = truncated(ui, &format!("{}  {}", ic::SHIELD_CHECK, disp(&kept_note(&it.path, orig))), 11.5, SUCCESS, w * 0.5);
+        let gap = 14.0;
+        let folder = it.path.parent().unwrap_or(&it.path);
+        let sub = truncated(ui, &short(folder), 11.5, DIM, w - keep.size().x - gap);
+        let kx = x + sub.size().x + gap;
+        let r = Rect::from_min_size(pos2(x, cy + 2.0), vec2(kx + keep.size().x - x, keep.size().y));
+        ui.painter().galley(pos2(x, cy + 2.0), sub, DIM);
+        ui.painter().galley(pos2(kx, cy + 2.0), keep, SUCCESS);
+        ui.interact(r, Id::new(("dup", &it.path)), Sense::hover())
+            .on_hover_text(format!("This copy:  {}\nKept copy:  {}", short(&it.path), short(orig)));
+    } else {
+        let sub = truncated(ui, &short(&it.path), 11.5, DIM, w);
+        ui.painter().galley(pos2(x, cy + 2.0), sub, DIM);
+    }
     out
 }
 
@@ -743,7 +871,13 @@ impl eframe::App for App {
         self.handle_messages();
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if !dropped.is_empty() {
-            self.add_videos(dropped);
+            // Folders bring their photos; photos go to the photo tab, everything else to videos.
+            let mut pics: Vec<PathBuf> = dropped.iter().filter(|p| p.is_dir()).flat_map(|d| photos::collect(d)).collect();
+            pics.extend(dropped.iter().filter(|p| photos::is_photo(p)).cloned());
+            let vids: Vec<PathBuf> = dropped.into_iter().filter(|p| p.is_file() && !photos::is_photo(p)).collect();
+            self.photos_tab = !pics.is_empty() && vids.is_empty();
+            self.add_photos(pics);
+            self.add_videos(vids);
             self.page = Page::Video;
         }
         self.thumbs.poll();
@@ -768,17 +902,23 @@ impl eframe::App for App {
             }
             self.last_batt = Some(Instant::now());
         }
-        if self.scanning || self.del_total > 0 || *self.encoding.lock().unwrap() {
+        if self.scanning || self.del_total > 0 || *self.encoding.lock().unwrap() || *self.photo_busy.lock().unwrap() {
             ctx.request_repaint_after(Duration::from_millis(120));
         } else {
             ctx.request_repaint_after(Duration::from_secs(3));
         }
 
+        if self.onboarding.is_some() {
+            self.onboarding(ctx);
+            return;
+        }
         self.sidebar(ctx);
         egui::CentralPanel::default()
             .frame(Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(28.0, 22.0)))
             .show(ctx, |ui| match self.page {
                 Page::Dashboard => self.dashboard(ui),
+                Page::Find => self.find_page(ui),
+                Page::Review => self.review_page(ui),
                 Page::Cat(cat) => self.category(ui, cat),
                 Page::Video => self.video_page(ui, ctx),
                 Page::Speed => self.speed_page(ui),
@@ -851,6 +991,9 @@ impl App {
                     section(ui, "OVERVIEW");
                     nav(ui, Page::Dashboard, ic::SQUARES_FOUR, ACCENT, "Dashboard", None);
                     nav(ui, Page::DiskMap, ic::CHART_DONUT, Color32::from_rgb(100, 210, 255), "Disk Map", None);
+                    nav(ui, Page::Find, ic::MAGNIFYING_GLASS, Color32::from_rgb(102, 212, 207), "Find", None);
+                    let staged = review::total(&self.staged);
+                    nav(ui, Page::Review, ic::LIST_CHECKS, SUCCESS, "Cleanup List", (!self.staged.is_empty()).then(|| human(staged)));
                     section(ui, "CLEANUP");
                     for cat in Cat::ALL {
                         if cat == Cat::Recordings {
@@ -864,7 +1007,7 @@ impl App {
                     section(ui, "MEDIA");
                     let (n, size) = self.total(Cat::Recordings);
                     nav(ui, Page::Cat(Cat::Recordings), cat_icon(Cat::Recordings), cat_color(Cat::Recordings), Cat::Recordings.title(), (n > 0).then(|| human(size)));
-                    nav(ui, Page::Video, ic::FILM_STRIP, violet, "Video Compressor", None);
+                    nav(ui, Page::Video, ic::FILM_STRIP, violet, "Compress", None);
                     section(ui, "OPTIMIZE");
                     nav(ui, Page::Speed, ic::ROCKET_LAUNCH, yellow, "Performance", None);
                     nav(ui, Page::Startup, ic::POWER, WARN, "Startup Items", None);
@@ -877,6 +1020,7 @@ impl App {
                 }
 
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    self.version_row(ui);
                     if self.scanning {
                         ui.horizontal(|ui| {
                             ui.add(egui::Spinner::new().size(14.0).color(ACCENT));
@@ -912,6 +1056,10 @@ impl App {
                         }
                         if c.labels.len() > 4 {
                             ui.label(RichText::new(format!("   and {} more", c.labels.len() - 4)).small().color(DIM));
+                        }
+                        if c.title.contains("uplicate") {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(format!("{}  One copy of every file stays where it is.", ic::SHIELD_CHECK)).small().color(SUCCESS));
                         }
                         ui.add_space(12.0);
                         ui.checkbox(&mut c.permanent, "Delete permanently (frees space right away)");
@@ -1106,6 +1254,9 @@ impl App {
                 self.page = Page::Speed;
             }
 
+            ui.add_space(14.0);
+            self.overview_card(ui);
+
             // ----- category cards -----
             ui.add_space(14.0);
             self.activity_card(ui);
@@ -1225,7 +1376,7 @@ impl App {
             ids.iter().copied().filter(|i| self.items[*i].selected && !self.deleting.contains(&self.items[*i].path)).collect();
         let sel_size: u64 = sel.iter().map(|i| self.items[*i].size).sum();
         let all = !ids.is_empty() && ids.iter().all(|i| self.items[*i].selected);
-        let mut remove = false;
+        let (mut remove, mut remove_all, mut stage) = (false, false, false);
         ui.horizontal(|ui| {
             search_field(ui, &mut self.query, "Search name or path", 240.0);
             let t = if all { format!("{}  Select none", ic::SQUARE) } else { format!("{}  Select all", ic::CHECK_SQUARE) };
@@ -1239,12 +1390,25 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.min_large_mb, 100..=10_000).logarithmic(true).suffix(" MB"));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if cat == Cat::Duplicates && sel.is_empty() {
+                    let size: u64 = ids.iter().map(|i| self.items[*i].size).sum();
+                    let t = format!("{}  Remove all {} duplicates · {}", ic::BROOM, ids.len(), human(size));
+                    remove_all = primary(ui, !ids.is_empty() && self.del_total == 0 && !self.scanning, t, DANGER)
+                        .on_hover_text("Moves every extra copy to the Trash. One copy of each file is always kept.")
+                        .clicked();
+                    return;
+                }
                 let t = if sel.is_empty() {
                     format!("{}  Select items to delete", ic::TRASH)
                 } else {
                     format!("{}  Delete {} · {}", ic::TRASH, sel.len(), human(sel_size))
                 };
                 remove = primary(ui, !sel.is_empty() && self.del_total == 0, t, DANGER).clicked();
+                if !sel.is_empty() {
+                    stage = soft(ui, true, format!("{}  Add to Cleanup list", ic::LIST_PLUS), SUCCESS)
+                        .on_hover_text("Set these aside, review them with everything else, then move them to the Trash together")
+                        .clicked();
+                }
             });
         });
         // Not used in N days: one chip per bucket with its count and size; click to filter.
@@ -1305,7 +1469,17 @@ impl App {
         ui.label(RichText::new("Click a row to select it · ⌘-click to add or remove · Shift-click to select a range · Space to Quick Look").small().color(DIM));
         ui.add_space(8.0);
         if remove {
-            self.ask_delete(format!("Delete from {}?", cat.title()), sel, cat.regenerable());
+            self.ask_delete(format!("Delete from {}?", cat.title()), sel.clone(), cat.regenerable());
+        }
+        if remove_all {
+            self.ask_delete("Remove all duplicate copies?".to_string(), ids.clone(), false);
+        }
+        if stage {
+            let items = sel.iter().map(|i| (self.items[*i].path.clone(), self.items[*i].label.clone(), self.items[*i].size)).collect();
+            self.stage(items);
+            for i in &sel {
+                self.items[*i].selected = false;
+            }
         }
 
         let mut single = None;
@@ -1385,14 +1559,25 @@ impl App {
 
     fn video_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let violet = Color32::from_rgb(94, 92, 230);
-        header(
-            ui,
-            ic::FILM_STRIP,
-            violet,
-            "Video Compressor",
-            "Shrinks videos to HEVC at the same resolution, and can restore them to their original size later.",
-            |_| {},
-        );
+        let sub = if self.photos_tab {
+            "Shrinks photos to HEIC or JPEG instead of deleting them. Originals stay unless you choose otherwise."
+        } else {
+            "Shrinks videos to HEVC at the same resolution, and can restore them to their original size later."
+        };
+        let mut tab = self.photos_tab;
+        header(ui, if tab { ic::IMAGE } else { ic::FILM_STRIP }, violet, "Compress", sub, |ui| {
+            if chip(ui, tab, &format!("{}  Photos", ic::IMAGE)) {
+                tab = true;
+            }
+            if chip(ui, !tab, &format!("{}  Videos", ic::FILM_STRIP)) {
+                tab = false;
+            }
+        });
+        self.photos_tab = tab;
+        if tab {
+            self.photos_panel(ui, ctx);
+            return;
+        }
 
         if video::tool("ffmpeg").is_none() {
             card(ui, |ui| {
@@ -1532,6 +1717,126 @@ impl App {
         }
     }
 
+    fn photos_panel(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let violet = Color32::from_rgb(94, 92, 230);
+        let busy = *self.photo_busy.lock().unwrap();
+        let r = card(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(6.0);
+                ui.label(RichText::new(ic::IMAGES).size(34.0).color(violet));
+                ui.label(RichText::new("Drop photos or folders here").size(16.0).strong().color(Color32::WHITE));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space((ui.available_width() - 330.0).max(0.0) / 2.0);
+                    if ui.button(format!("{}  Choose photos", ic::IMAGE)).clicked() {
+                        if let Some(files) = rfd::FileDialog::new().add_filter("Photos", &photos::EXTS).pick_files() {
+                            self.add_photos(files);
+                        }
+                    }
+                    if ui.button(format!("{}  Choose a folder", ic::FOLDER_OPEN)).on_hover_text("Adds every photo of 300 KB or more inside it").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().set_directory(scan::home().join("Pictures")).pick_folder() {
+                            let found = photos::collect(&dir);
+                            if found.is_empty() {
+                                self.toast("No photos of 300 KB or more in that folder", false);
+                            }
+                            self.add_photos(found);
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+            });
+        });
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            ui.painter().rect_stroke(r.response.rect, 14.0, Stroke::new(2.0_f32, violet));
+        }
+        ui.add_space(12.0);
+
+        let queued = self.photo_jobs.lock().unwrap().iter().filter(|j| matches!(j.status, photos::Status::Queued)).count();
+        let mut start = false;
+        ui.horizontal(|ui| {
+            let o = &mut self.photo_opts;
+            ui.label(RichText::new("Quality").color(DIM));
+            ui.selectable_value(&mut o.quality, Quality::Smallest, "Smallest");
+            ui.selectable_value(&mut o.quality, Quality::Balanced, "Balanced");
+            ui.selectable_value(&mut o.quality, Quality::Best, "Best");
+            ui.add_space(10.0);
+            ui.label(RichText::new("Format").color(DIM));
+            ui.selectable_value(&mut o.format, photos::Format::Heic, "HEIC").on_hover_text("Smallest. Opens on any Apple device");
+            ui.selectable_value(&mut o.format, photos::Format::Jpeg, "JPEG").on_hover_text("Opens everywhere");
+            ui.add_space(10.0);
+            ui.checkbox(&mut o.replace, "Move originals to Trash");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add_enabled(!busy, Button::new(format!("{} Clear", ic::X))).clicked() {
+                    self.photo_jobs.lock().unwrap().clear();
+                }
+                start = primary(ui, !busy && queued > 0, format!("{}  Start ({queued})", ic::PLAY), violet).clicked();
+            });
+        });
+        if start {
+            *self.photo_busy.lock().unwrap() = true;
+            let (jobs, flag, opts, ctx) = (self.photo_jobs.clone(), self.photo_busy.clone(), self.photo_opts, ctx.clone());
+            std::thread::spawn(move || {
+                photos::run_queue(jobs, opts, ctx.clone());
+                *flag.lock().unwrap() = false;
+                ctx.request_repaint();
+            });
+        }
+        ui.add_space(12.0);
+
+        let snapshot = self.photo_jobs.lock().unwrap().clone();
+        if snapshot.is_empty() {
+            return;
+        }
+        let (before, after) = snapshot.iter().fold((0u64, 0u64), |(b, a), j| match &j.status {
+            photos::Status::Done(_, s) => (b + j.size, a + s),
+            _ => (b, a),
+        });
+        if before > 0 {
+            ui.label(RichText::new(format!("{} Saved {} so far ({} → {})", ic::CHECK_CIRCLE, human(before - after), human(before), human(after))).color(SUCCESS));
+            ui.add_space(6.0);
+        }
+        card(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("photo-jobs").auto_shrink([false; 2]).show_rows(ui, 46.0, snapshot.len(), |ui, range| {
+                for j in &snapshot[range] {
+                    let name = j.path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    ui.allocate_ui_with_layout(vec2(ui.available_width(), 46.0), Layout::right_to_left(Align::Center), |ui| {
+                        match &j.status {
+                            photos::Status::Queued => {
+                                ui.label(RichText::new(format!("{} Waiting", ic::CLOCK)).color(DIM));
+                            }
+                            photos::Status::Running => {
+                                ui.add(egui::Spinner::new().size(14.0).color(violet));
+                                ui.label(RichText::new("Compressing…").color(DIM));
+                            }
+                            photos::Status::Done(out, size) => {
+                                if icon_button(ui, ic::FOLDER_OPEN, DIM, "Show in Finder").clicked() {
+                                    system::reveal(out);
+                                }
+                                let pct = 100.0 - *size as f64 / j.size.max(1) as f64 * 100.0;
+                                ui.label(RichText::new(format!("{} {}  −{pct:.0}%", ic::CHECK_CIRCLE, human(*size))).color(SUCCESS).strong());
+                            }
+                            photos::Status::Skipped(why) => {
+                                ui.label(RichText::new(why).small().color(DIM));
+                            }
+                            photos::Status::Failed(e) => {
+                                ui.add(Label::new(RichText::new(e).color(DANGER).small()).truncate());
+                            }
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let mut tui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(ui.cursor().min, vec2(34.0, 34.0))));
+                            thumbs::preview(&mut tui, &mut self.thumbs, &j.path, 34.0, ic::IMAGE, violet);
+                            ui.add_space(42.0);
+                            ui.vertical(|ui| {
+                                ui.add(Label::new(RichText::new(&name).color(Color32::WHITE)).truncate());
+                                ui.label(RichText::new(format!("{} · {}", human(j.size), short(j.path.parent().unwrap_or(&j.path)))).small().color(DIM));
+                            });
+                        });
+                    });
+                }
+            });
+        });
+    }
+
     fn speed_page(&mut self, ui: &mut Ui) {
         let yellow = Color32::from_rgb(255, 214, 10);
         let live = self.sampler.live.lock().unwrap().clone();
@@ -1651,6 +1956,9 @@ impl App {
                 self.toast(format!("Asked {name} to quit"), true);
             }
 
+            ui.add_space(18.0);
+            self.ports_card(ui);
+
             // ----- quick fixes -----
             ui.add_space(18.0);
             ui.label(RichText::new("Quick fixes").size(16.0).strong().color(Color32::WHITE));
@@ -1740,6 +2048,74 @@ impl App {
             });
             ui.add_space(8.0);
         });
+    }
+}
+
+impl App {
+    /// Apps listening for network connections, refreshed every few seconds in the background.
+    fn ports_card(&mut self, ui: &mut Ui) {
+        if self.ports_at.map_or(true, |t| t.elapsed() > Duration::from_secs(5)) {
+            self.ports_at = Some(Instant::now());
+            let (out, ctx) = (self.ports.clone(), ui.ctx().clone());
+            std::thread::spawn(move || {
+                let v = system::open_ports();
+                *out.lock().unwrap() = Some(v);
+                ctx.request_repaint();
+            });
+        }
+        let ports = self.ports.lock().unwrap().clone();
+        let exposed = ports.as_ref().map_or(0, |v| v.iter().filter(|p| p.exposed()).count());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Open ports").size(16.0).strong().color(Color32::WHITE));
+            ui.label(RichText::new("Your apps waiting for network connections").small().color(DIM));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if exposed > 0 {
+                    ui.label(RichText::new(format!("{} {exposed} open to your network", ic::WARNING)).small().color(WARN))
+                        .on_hover_text("Other devices on the same Wi-Fi can try to connect to these");
+                }
+            });
+        });
+        ui.add_space(8.0);
+        let mut stop = None;
+        card(ui, |ui| {
+            let Some(ports) = &ports else {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0).color(DIM));
+                    ui.label(RichText::new("Looking…").color(DIM));
+                });
+                return;
+            };
+            if ports.is_empty() {
+                ui.label(RichText::new(format!("{}  None of your apps are listening for connections", ic::CHECK_CIRCLE)).color(SUCCESS));
+            }
+            for (k, p) in ports.iter().enumerate() {
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), 34.0), Layout::right_to_left(Align::Center), |ui| {
+                    if soft(ui, true, "Stop", DANGER).on_hover_text(format!("Ask {} (PID {}) to quit", p.command, p.pid)).clicked() {
+                        stop = Some(p.clone());
+                    }
+                    if p.proto == "TCP" && icon_btn(ui, ic::GLOBE, &format!("Open http://localhost:{}", p.port), false).clicked() {
+                        system::open(&format!("http://localhost:{}", p.port));
+                    }
+                    let (text, c) = if p.exposed() { ("Open to your network", WARN) } else { ("This Mac only", DIM) };
+                    ui.label(RichText::new(text).small().color(c)).on_hover_text(format!("Listening on {}", p.addr));
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add_sized(vec2(64.0, 20.0), Label::new(RichText::new(format!(":{}", p.port)).monospace().strong().color(Color32::WHITE)));
+                        ui.label(RichText::new(p.proto).small().color(DIM));
+                        ui.add_space(6.0);
+                        ui.add(Label::new(RichText::new(&p.command).color(Color32::WHITE)).truncate());
+                        ui.label(RichText::new(format!("PID {}", p.pid)).small().color(DIM));
+                    });
+                });
+                if k + 1 < ports.len() {
+                    ui.separator();
+                }
+            }
+        });
+        if let Some(p) = stop {
+            system::stop_pid(p.pid);
+            self.ports_at = Some(Instant::now() - Duration::from_secs(4));
+            self.toast(format!("Asked {} to quit", p.command), true);
+        }
     }
 }
 
@@ -1883,6 +2259,67 @@ fn main() -> eframe::Result {
 }
 
 impl App {
+    /// The whole drive on one bar: what could be cleared (in color, per category) next to
+    /// what is kept (gray) and what is free.
+    fn overview_card(&self, ui: &mut Ui) {
+        let Some((free, total)) = self.disk else { return };
+        let used = total.saturating_sub(free);
+        let segs: Vec<(&str, u64, Color32)> = Cat::ALL
+            .iter()
+            .filter(|c| **c != Cat::Recordings)
+            .map(|c| (c.title(), self.total(*c).1, cat_color(*c)))
+            .filter(|s| s.1 > 0)
+            .collect();
+        let clear: u64 = segs.iter().map(|s| s.1).sum::<u64>().min(used);
+        let safe: u64 = self.items.iter().filter(|i| i.safe).map(|i| i.size).sum::<u64>().min(clear);
+        let kept = used - clear;
+        let kept_c = Color32::from_rgb(92, 92, 100);
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{}  Macintosh HD", ic::HARD_DRIVE)).strong().color(Color32::WHITE));
+                ui.label(RichText::new(format!("{} free of {}", human(free), human(total))).color(DIM));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(format!("{} you could clear", human(clear))).strong().color(SUCCESS));
+                });
+            });
+            ui.add_space(8.0);
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, 6.0, TRACK);
+            let mut x = rect.left();
+            let mut tip = None;
+            let parts = segs.iter().map(|s| (s.0, s.1, s.2)).chain([("Kept (apps, photos, documents, system)", kept, kept_c)]);
+            for (name, size, color) in parts {
+                let w = rect.width() * size as f32 / total.max(1) as f32;
+                if w < 0.5 {
+                    continue;
+                }
+                let r = Rect::from_min_max(pos2(x, rect.top()), pos2((x + w).min(rect.right()), rect.bottom()));
+                p.rect_filled(r, 2.0, color);
+                if resp.hover_pos().is_some_and(|h| r.contains(h)) {
+                    tip = Some(format!("{name} · {}", human(size)));
+                }
+                x += w;
+            }
+            if let Some(t) = tip {
+                resp.on_hover_text(t);
+            }
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                let key = |ui: &mut Ui, c: Color32, text: String| {
+                    let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                    ui.painter().rect_filled(r, 3.0, c);
+                    ui.label(RichText::new(text).small().color(DIM));
+                    ui.add_space(8.0);
+                };
+                key(ui, SUCCESS, format!("Safe to clear {}", human(safe)));
+                key(ui, WARN, format!("Worth a look {}", human(clear - safe)));
+                key(ui, kept_c, format!("Kept {}", human(kept)));
+                key(ui, TRACK, format!("Free {}", human(free)));
+            });
+        });
+    }
+
     /// "Freed this week" card with an 8-week bar chart from the cleanup history.
     fn activity_card(&mut self, ui: &mut Ui) {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);

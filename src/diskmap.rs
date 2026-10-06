@@ -132,7 +132,8 @@ struct Progress {
 }
 
 enum Outcome {
-    Full(Node, Changes),
+    /// A whole map; changes only for the Macintosh HD map, which keeps snapshots.
+    Full(Node, Option<Changes>),
     Sub(Node),
 }
 
@@ -264,7 +265,29 @@ fn full_scan(prog: &Progress, disk: Option<(u64, u64)>) -> Outcome {
         Some((t, old)) => Changes::between(t, now, &old, &new),
         None => Changes { since: None, latest: now, grew: vec![], shrank: vec![] },
     };
-    Outcome::Full(root, changes)
+    Outcome::Full(root, Some(changes))
+}
+
+/// Maps any folder or mounted volume (external drives and network shares included).
+fn folder_scan(prog: &Progress, path: PathBuf) -> Outcome {
+    let (mut groups, _) = scan_groups(vec![ls(&path)], FIRST_THRESH, prog, &path, false);
+    let name = volume_name(&path);
+    Outcome::Full(dir_node(&name, path, groups.pop().unwrap_or_default(), FIRST_THRESH), None)
+}
+
+fn volume_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+}
+
+/// Mounted volumes other than the startup disk: external drives, disk images, network shares.
+fn volumes() -> Vec<PathBuf> {
+    let boot = fs::canonicalize("/").unwrap_or_default();
+    let mut v: Vec<PathBuf> = ls(Path::new("/Volumes"))
+        .into_iter()
+        .filter(|p| !volume_name(p).starts_with('.') && fs::canonicalize(p).is_ok_and(|c| c != boot))
+        .collect();
+    v.sort();
+    v
 }
 
 fn sub_scan(prog: &Progress, name: &str, path: PathBuf, thresh: u64) -> Outcome {
@@ -288,13 +311,6 @@ fn drop_removed(n: &mut Node, removed: &HashSet<PathBuf>) -> u64 {
     }
     n.size = n.size.saturating_sub(freed);
     freed
-}
-
-/// Folders that must never be offered for deletion from the map.
-fn protected(p: &Path) -> bool {
-    let h = scan::home();
-    let keep = ["Library", "Library/Application Support", "Library/Containers", "Library/Group Containers", "Library/Preferences", "Library/Mobile Documents"];
-    p == h || p == Path::new("/Applications") || p.parent().map_or(true, |x| x == Path::new("/")) || keep.iter().any(|k| p == h.join(k))
 }
 
 // ---------- snapshots ----------
@@ -570,13 +586,22 @@ pub struct State {
     chart_hover: Option<usize>,
     changes: Option<Changes>,
     loaded: bool,
+    /// What is mapped: None = Macintosh HD, Some = a folder or volume.
+    target: Option<PathBuf>,
+    scanned_at: Option<u64>,
+    pub inspect: inspect::State,
 }
 
 enum Act {
     Scan,
+    /// Map something else: None = Macintosh HD, Some(None) = ask for a folder.
+    Target(Option<Option<PathBuf>>),
     Focus(Vec<usize>),
     Reveal(PathBuf),
     Trash(PathBuf, String, u64),
+    Stage(PathBuf, String, u64),
+    /// Path and its parent's (name, size).
+    Inspect(PathBuf, Option<(String, u64)>),
 }
 
 impl State {
@@ -641,7 +666,10 @@ impl State {
                 Outcome::Full(root, changes) => {
                     self.root = Some(root);
                     self.focus.clear();
-                    self.changes = Some(changes);
+                    self.scanned_at = Some(unix_now());
+                    if changes.is_some() {
+                        self.changes = changes;
+                    }
                     self.gen += 1;
                     self.removed_seen = 0;
                 }
@@ -680,8 +708,12 @@ impl State {
         }
         let prog = Arc::new(Progress::default());
         let p2 = prog.clone();
+        let target = self.target.clone();
         std::thread::spawn(move || {
-            let out = full_scan(&p2, system::disk());
+            let out = match target {
+                None => full_scan(&p2, system::disk()),
+                Some(p) => folder_scan(&p2, p),
+            };
             *p2.done.lock().unwrap() = Some(out);
         });
         self.task = Some(Task { prog, target: None, started: Instant::now() });
@@ -719,18 +751,43 @@ impl App {
         if st.task.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(150));
         }
-        let sub = match (&st.task, &st.changes) {
-            (Some(t), _) if t.target.is_none() => "Mapping your disk…".to_string(),
-            (_, Some(c)) if st.root.is_some() => format!("Scanned {}. Click a ring to zoom in, the center to go back.", ago(unix_now().saturating_sub(c.latest))),
+        let what = st.target.as_deref().map_or("Macintosh HD".to_string(), volume_name);
+        let sub = match (&st.task, st.scanned_at.or(st.changes.as_ref().map(|c| c.latest))) {
+            (Some(t), _) if t.target.is_none() => format!("Mapping {what}…"),
+            (_, Some(at)) if st.root.is_some() => format!("Scanned {}. Click a ring to zoom in, the center to go back.", ago(unix_now().saturating_sub(at))),
             _ => "See what fills your disk, and what grew since last time.".to_string(),
         };
         let mut act: Option<Act> = None;
         let has_root = st.root.is_some();
+        let current = st.target.clone();
         header(ui, ic::CHART_DONUT, ACCENT, "Disk Map", &sub, |ui| {
             let label = format!("{}  {}", if has_root { ic::ARROWS_CLOCKWISE } else { ic::MAGNIFYING_GLASS }, if has_root { "Rescan" } else { "Scan" });
             if primary(ui, !busy_full, label, ACCENT).clicked() {
                 act = Some(Act::Scan);
             }
+            ui.add_enabled_ui(!busy_full, |ui| {
+                ui.menu_button(format!("{}  {what}  {}", ic::HARD_DRIVES, ic::CARET_DOWN), |ui| {
+                    ui.set_min_width(220.0);
+                    if ui.selectable_label(current.is_none(), format!("{}  Macintosh HD", ic::HARD_DRIVE)).clicked() {
+                        act = Some(Act::Target(None));
+                        ui.close_menu();
+                    }
+                    for v in volumes() {
+                        let on = current.as_ref() == Some(&v);
+                        if ui.selectable_label(on, format!("{}  {}", ic::HARD_DRIVES, volume_name(&v))).clicked() {
+                            act = Some(Act::Target(Some(Some(v))));
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button(format!("{}  Choose a folder…", ic::FOLDER_OPEN)).clicked() {
+                        act = Some(Act::Target(Some(None)));
+                        ui.close_menu();
+                    }
+                })
+                .response
+                .on_hover_text("Map your Mac, an external drive, a network share or any folder");
+            });
         });
 
         egui::ScrollArea::vertical().id_salt("diskmap_page").auto_shrink([false; 2]).show(ui, |ui| {
@@ -763,6 +820,7 @@ impl App {
                         ui.add_space(6.0);
                         ui.label(RichText::new("See where your space went").size(18.0).strong().color(Color32::WHITE));
                         ui.label(RichText::new("Maps your home folder and apps into an interactive chart. Nothing is changed.").color(DIM));
+                        ui.label(RichText::new("Pick an external drive, network share or folder from the menu above to map that instead.").small().color(DIM));
                         ui.add_space(12.0);
                         if primary(ui, true, format!("{}  Scan", ic::MAGNIFYING_GLASS), ACCENT).clicked() {
                             act = Some(Act::Scan);
@@ -772,11 +830,45 @@ impl App {
                 });
             }
             ui.add_space(12.0);
-            self.changes_card(ui);
+            if let Some(a) = self.diskmap.inspect.show(ui) {
+                act = Some(match a {
+                    inspect::Act::Inspect(p) => Act::Inspect(p, None),
+                    inspect::Act::Stage(p, n, s) => Act::Stage(p, n, s),
+                    inspect::Act::Reveal(p) => Act::Reveal(p),
+                    inspect::Act::Close => {
+                        self.diskmap.inspect.close();
+                        Act::Focus(self.diskmap.focus.clone())
+                    }
+                });
+                ui.add_space(12.0);
+            }
+            if self.diskmap.target.is_none() {
+                self.changes_card(ui);
+            }
         });
 
         match act {
             Some(Act::Scan) => self.diskmap.start_full(),
+            Some(Act::Target(t)) => {
+                let target = match t {
+                    None => None,
+                    Some(Some(v)) => Some(v),
+                    Some(None) => match rfd::FileDialog::new().set_directory(scan::home()).pick_folder() {
+                        Some(f) => Some(f),
+                        None => return,
+                    },
+                };
+                self.diskmap.target = target;
+                self.diskmap.root = None;
+                self.diskmap.focus.clear();
+                self.diskmap.inspect.close();
+                self.diskmap.start_full();
+            }
+            Some(Act::Stage(p, label, size)) => self.stage(vec![(p, label, size)]),
+            Some(Act::Inspect(p, parent)) => {
+                let ctx = ui.ctx().clone();
+                self.diskmap.inspect.open(p, parent, &ctx);
+            }
             Some(Act::Focus(f)) => {
                 self.diskmap.focus = f;
                 self.diskmap.list_hover = None;
@@ -998,6 +1090,13 @@ impl App {
                 }
             }
         });
+        if let Some(p) = &focus.path {
+            ui.horizontal(|ui| {
+                if ui.link(format!("{}  Inspect this folder", ic::INFO)).clicked() {
+                    *act = Some(Act::Inspect(p.clone(), None));
+                }
+            });
+        }
         ui.add_space(4.0);
         ui.separator();
 
@@ -1028,7 +1127,7 @@ impl App {
                     let color = base_color(i);
                     p.circle_filled(rect.left_center() + vec2(12.0, -5.0), 5.0, color);
 
-                    let buttons = if c.real() { 66.0 } else { 0.0 };
+                    let buttons = if c.real() { 150.0 } else { 0.0 };
                     let size_x = rect.right() - buttons - 8.0;
                     p.text(pos2(size_x, rect.center().y - 5.0), Align2::RIGHT_CENTER, human(c.size), FontId::proportional(13.5), Color32::WHITE);
                     let share = format!("{:.0}%", pct(c.size, focus.size) * 100.0);
@@ -1048,8 +1147,15 @@ impl App {
                         let brect = Rect::from_min_max(pos2(rect.right() - buttons, rect.top()), rect.right_bottom());
                         let mut bui = ui.new_child(UiBuilder::new().max_rect(brect).layout(Layout::right_to_left(Align::Center)));
                         let path = c.path.clone().unwrap_or_default();
-                        if !protected(&path) && icon_button(&mut bui, ic::TRASH, DANGER, "Move to Trash").clicked() {
+                        let ok = !scan::protected(&path);
+                        if ok && icon_button(&mut bui, ic::TRASH, DANGER, "Move to Trash").clicked() {
                             *act = Some(Act::Trash(path.clone(), c.name.clone(), c.size));
+                        }
+                        if ok && icon_button(&mut bui, ic::LIST_PLUS, DIM, "Add to Cleanup list").clicked() {
+                            *act = Some(Act::Stage(path.clone(), c.name.clone(), c.size));
+                        }
+                        if icon_button(&mut bui, ic::INFO, DIM, "Inspect").clicked() {
+                            *act = Some(Act::Inspect(path.clone(), Some((focus.name.clone(), focus.size))));
                         }
                         if icon_button(&mut bui, ic::FOLDER_OPEN, DIM, "Show in Finder").clicked() {
                             *act = Some(Act::Reveal(path));

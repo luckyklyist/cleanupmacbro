@@ -245,6 +245,62 @@ fn push(v: &mut Vec<f32>, x: f32) {
     }
 }
 
+// ---------- open network ports ----------
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Port {
+    pub pid: u32,
+    pub command: String,
+    pub proto: &'static str,
+    pub port: u16,
+    /// Address it listens on: "*" (every network), "127.0.0.1", "[::1]", …
+    pub addr: String,
+}
+
+impl Port {
+    /// Reachable from other devices on the network, not just this Mac.
+    pub fn exposed(&self) -> bool {
+        !(self.addr.starts_with("127.") || self.addr == "[::1]" || self.addr == "localhost")
+    }
+}
+
+/// Parses `lsof -F pcPn` output. Keeps listening sockets only (UDP ones with no remote end).
+pub fn parse_ports(text: &str) -> Vec<Port> {
+    let (mut pid, mut command, mut proto) = (0u32, String::new(), "");
+    let mut out: Vec<Port> = Vec::new();
+    for l in text.lines() {
+        let (tag, v) = l.split_at(l.len().min(1));
+        match tag {
+            "p" => pid = v.parse().unwrap_or(0),
+            "c" => command = v.to_string(),
+            "P" => proto = if v == "UDP" { "UDP" } else { "TCP" },
+            "n" if !v.contains("->") => {
+                let Some((addr, port)) = v.rsplit_once(':') else { continue };
+                let Ok(port) = port.parse::<u16>() else { continue };
+                let p = Port { pid, command: command.clone(), proto, port, addr: addr.to_string() };
+                if !out.iter().any(|o| o.pid == p.pid && o.port == p.port && o.proto == p.proto) {
+                    out.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Ports your apps are listening on, lowest port first.
+pub fn open_ports() -> Vec<Port> {
+    let mut v = parse_ports(&run("/usr/sbin/lsof", &["-nP", "-iTCP", "-sTCP:LISTEN", "-FpcPn"]));
+    v.extend(parse_ports(&run("/usr/sbin/lsof", &["-nP", "-iUDP", "-FpcPn"])));
+    v.sort_by(|a, b| a.port.cmp(&b.port).then(a.proto.cmp(b.proto)));
+    v
+}
+
+/// Asks a process to quit (SIGTERM).
+pub fn stop_pid(pid: u32) {
+    let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
+}
+
 // ---------- keep awake (wraps macOS `caffeinate`) ----------
 
 fn awake_file() -> std::path::PathBuf {
@@ -288,4 +344,20 @@ pub fn awake_until() -> Option<u64> {
 
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_lsof_ports() {
+        let text = "p444\ncrapportd\nf8\nPTCP\nn*:61520\nf9\nPTCP\nn*:61520\np518\ncRaycast\nf30\nPTCP\nn127.0.0.1:7265\n\
+                    p9\ncnode\nf3\nPTCP\nn[::1]:3000\np485\ncidentityservicesd\nf20\nPUDP\nn*:*\nf21\nPUDP\nn10.0.0.2:5353->1.2.3.4:53\nf22\nPUDP\nn*:5353\n";
+        let v = parse_ports(text);
+        assert_eq!(v.len(), 4, "{v:?}");
+        assert_eq!((v[0].command.as_str(), v[0].port, v[0].exposed()), ("rapportd", 61520, true));
+        assert!(!v[1].exposed() && !v[2].exposed());
+        assert_eq!((v[3].proto, v[3].port), ("UDP", 5353));
+    }
 }

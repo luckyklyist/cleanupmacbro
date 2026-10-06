@@ -53,6 +53,7 @@ enum Filter {
     All,
     Unused,
     Largest,
+    Updates,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -113,6 +114,9 @@ pub struct State {
     filter: Filter,
     open: HashSet<PathBuf>,
     seen_removed: usize,
+    /// Kernel counters of the running processes of each expanded app.
+    live: HashMap<PathBuf, usage::Counters>,
+    live_at: Option<Instant>,
 }
 
 impl State {
@@ -151,6 +155,26 @@ impl State {
             }
         }
         gone
+    }
+
+    /// Refreshes the process counters of expanded apps every few seconds.
+    fn refresh_live(&mut self) {
+        if self.open.is_empty() || self.live_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) {
+            return;
+        }
+        self.live_at = Some(Instant::now());
+        let procs = system::top_processes(usize::MAX);
+        self.live.clear();
+        for a in self.apps.iter().filter(|a| self.open.contains(&a.path)) {
+            let pids: Vec<u32> = procs
+                .iter()
+                .filter(|p| p.app_path.as_ref() == Some(&a.path) || (p.is_app && p.name == a.name))
+                .flat_map(|p| p.pids.iter().copied())
+                .collect();
+            if !pids.is_empty() {
+                self.live.insert(a.path.clone(), usage::counters(&pids));
+            }
+        }
     }
 
     fn prune(&mut self, removed: &HashSet<PathBuf>) {
@@ -593,7 +617,193 @@ enum Act {
     Reveal(PathBuf),
 }
 
+/// Small line chart over the last 24 hours. `value` maps a sample to 0..=1.
+fn day_chart(ui: &mut Ui, samples: &[usage::Sample], color: Color32, value: impl Fn(&usage::Sample) -> f32, label: impl Fn(&usage::Sample) -> String) {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+    let p = ui.painter();
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0_f32, TRACK));
+    let now = scan::now_secs();
+    let x = |t: u64| rect.right() - (now.saturating_sub(t)) as f32 / 86_400.0 * rect.width();
+    let pts: Vec<Pos2> = samples.iter().map(|s| pos2(x(s.0), rect.bottom() - value(s).clamp(0.0, 1.0) * (rect.height() - 2.0))).collect();
+    // Gaps of more than five minutes (Clean You was closed) break the line.
+    let mut run = vec![];
+    for (i, pt) in pts.iter().enumerate() {
+        if i > 0 && samples[i].0 - samples[i - 1].0 > 300 {
+            p.add(Shape::line(std::mem::take(&mut run), Stroke::new(1.5_f32, color)));
+        }
+        run.push(*pt);
+    }
+    if run.len() == 1 {
+        p.circle_filled(run[0], 2.0, color);
+    }
+    p.add(Shape::line(run, Stroke::new(1.5_f32, color)));
+    if let Some(h) = resp.hover_pos() {
+        if let Some((i, pt)) = pts.iter().enumerate().min_by(|a, b| (a.1.x - h.x).abs().total_cmp(&(b.1.x - h.x).abs())) {
+            if (pt.x - h.x).abs() < 12.0 {
+                p.circle_filled(*pt, 3.0, Color32::WHITE);
+                let mins = now.saturating_sub(samples[i].0) / 60;
+                let when = if mins < 60 { format!("{mins} min ago") } else { format!("{} h ago", mins / 60) };
+                resp.on_hover_text(format!("{} · {when}", label(&samples[i])));
+            }
+        }
+    }
+}
+
+/// CPU and memory over the last day, plus live counters of the running processes.
+fn usage_section(ui: &mut Ui, samples: &[usage::Sample], live: Option<&usage::Counters>) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(52.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(format!("{}  Last 24 hours, while Clean You was open", ic::CHART_LINE)).small().strong().color(DIM));
+            if samples.is_empty() {
+                ui.label(RichText::new("Not seen running yet. Usage is recorded once a minute.").small().color(DIM));
+            } else {
+                let peak_cpu = samples.iter().map(|s| s.1).fold(0.0_f32, f32::max);
+                let avg_cpu = samples.iter().map(|s| s.1).sum::<f32>() / samples.len() as f32;
+                let peak_mem = samples.iter().map(|s| s.2).max().unwrap_or(0);
+                let avg_mem = samples.iter().map(|s| s.2).sum::<u64>() / samples.len() as u64;
+                ui.columns(2, |cols| {
+                    cols[0].label(RichText::new(format!("CPU · avg {avg_cpu:.0}% · peak {peak_cpu:.0}%")).small().color(Color32::WHITE));
+                    let top = peak_cpu.max(100.0);
+                    day_chart(&mut cols[0], samples, ACCENT, |s| s.1 / top, |s| format!("{:.0}% CPU", s.1));
+                    cols[1].label(RichText::new(format!("Memory · avg {} · peak {}", human(avg_mem), human(peak_mem))).small().color(Color32::WHITE));
+                    let top = peak_mem.max(1) as f32;
+                    day_chart(&mut cols[1], samples, SUCCESS, |s| s.2 as f32 / top, |s| human(s.2));
+                });
+            }
+            if let Some(c) = live {
+                ui.add_space(4.0);
+                let facts = [
+                    ("Processes", c.processes.to_string(), "Running processes of this app, helpers included"),
+                    ("CPU time", usage::duration(c.cpu_time), "Processor time used since they started"),
+                    ("Memory", human(c.footprint), "Physical footprint, as Activity Monitor counts it"),
+                    ("Disk read", human(c.disk_read), "Read from disk since they started"),
+                    ("Disk written", human(c.disk_written), "Written to disk since they started"),
+                    ("Wakeups", (c.idle_wakeups + c.interrupt_wakeups).to_string(), "Times they woke the CPU. Many wakeups drain the battery"),
+                ];
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("{} Running now", ic::PULSE)).small().color(SUCCESS));
+                    for (k, v, tip) in facts {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(k).small().color(DIM));
+                        ui.label(RichText::new(v).small().strong().color(Color32::WHITE)).on_hover_text(tip);
+                    }
+                });
+            }
+        });
+    });
+    ui.add_space(4.0);
+}
+
 impl App {
+    /// The Updates tab: asks each app's update feed for its latest version, on request.
+    fn updates_view(&mut self, ui: &mut Ui) {
+        let mut check = false;
+        let prog = self.updates.as_ref().map(|u| {
+            let p = u.lock().unwrap();
+            (p.checked, p.total, p.with_feed, p.found.clone(), p.done)
+        });
+        egui::ScrollArea::vertical().id_salt("updates").auto_shrink([false; 2]).show(ui, |ui| {
+            card(ui, |ui| {
+                let Some((checked, total, with_feed, found, done)) = prog else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.label(RichText::new(ic::ARROW_CIRCLE_UP).size(44.0).color(ACCENT));
+                        ui.label(RichText::new("See which apps have updates waiting").size(17.0).strong().color(Color32::WHITE));
+                        ui.label(RichText::new("Asks the App Store, each app's own update feed, and Homebrew's public app catalog.").color(DIM));
+                        ui.label(RichText::new("The catalog is downloaded whole, so your list of apps never leaves your Mac.").small().color(DIM));
+                        ui.add_space(12.0);
+                        check = primary(ui, !self.uninstall.apps.is_empty(), format!("{}  Check for updates", ic::ARROWS_CLOCKWISE), ACCENT).clicked();
+                        ui.add_space(20.0);
+                    });
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    badge(ui, ic::ARROW_CIRCLE_UP, ACCENT, 34.0);
+                    ui.vertical(|ui| {
+                        let title = if !done {
+                            format!("Checking {checked} of {total}…")
+                        } else if found.is_empty() {
+                            "Everything is up to date".to_string()
+                        } else {
+                            format!("{} update{} waiting", found.len(), if found.len() == 1 { "" } else { "s" })
+                        };
+                        ui.label(RichText::new(title).strong().color(Color32::WHITE));
+                        let none = total.saturating_sub(with_feed);
+                        ui.label(RichText::new(format!("{with_feed} apps checked · {none} have no public version to compare with")).small().color(DIM));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let b = Button::new(format!("{}  Check again", ic::ARROWS_CLOCKWISE)).rounding(9.0).min_size(vec2(0.0, 34.0));
+                        check = ui.add_enabled(done, b).clicked();
+                    });
+                });
+                if !done {
+                    ui.add_space(8.0);
+                    bar(ui, checked as f32 / total.max(1) as f32, ACCENT);
+                }
+                if !found.is_empty() {
+                    ui.add_space(8.0);
+                }
+                for (k, u) in found.iter().enumerate() {
+                    ui.allocate_ui_with_layout(vec2(ui.available_width(), 52.0), Layout::right_to_left(Align::Center), |ui| {
+                        match &u.source {
+                            updates::Source::AppStore { url } => {
+                                if soft(ui, true, format!("{}  App Store", ic::STOREFRONT), ACCENT).clicked() {
+                                    system::open(&url.replacen("https://", "macappstore://", 1));
+                                }
+                            }
+                            updates::Source::Catalog { homepage } => {
+                                if soft(ui, true, format!("{}  Open to update", ic::ARROW_SQUARE_OUT), ACCENT)
+                                    .on_hover_text("Most apps update themselves when opened, or from their “Check for Updates…” menu")
+                                    .clicked()
+                                {
+                                    system::open_path(&u.app);
+                                }
+                                if let Some(h) = homepage {
+                                    if ui.link("Download page").clicked() {
+                                        system::open(h);
+                                    }
+                                }
+                            }
+                            updates::Source::Sparkle { notes } => {
+                                if soft(ui, true, format!("{}  Open to update", ic::ARROW_SQUARE_OUT), ACCENT)
+                                    .on_hover_text("Opens the app. Use its “Check for Updates…” menu item if it doesn't ask by itself")
+                                    .clicked()
+                                {
+                                    system::open_path(&u.app);
+                                }
+                                if let Some(n) = notes {
+                                    if ui.link("What's new").clicked() {
+                                        system::open(n);
+                                    }
+                                }
+                            }
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            thumbs::preview(ui, &mut self.thumbs, &u.app, 36.0, ic::PACKAGE, ACCENT);
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&u.name).strong().color(Color32::WHITE));
+                                ui.label(RichText::new(format!("{}  {}  {}", u.current, ic::ARROW_RIGHT, u.latest)).small().color(SUCCESS));
+                            });
+                        });
+                    });
+                    if k + 1 < found.len() {
+                        ui.separator();
+                    }
+                }
+            });
+        });
+        if check {
+            let apps: Vec<(PathBuf, String)> = self.uninstall.apps.iter().map(|a| (a.path.clone(), a.name.clone())).collect();
+            let prog = Arc::new(Mutex::new(updates::Progress::default()));
+            self.updates = Some(prog.clone());
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || updates::check_all(apps, prog, ctx));
+        }
+    }
+
     pub(crate) fn uninstall_page(&mut self, ui: &mut Ui) {
         if !self.uninstall.started {
             self.uninstall.rescan();
@@ -645,7 +855,7 @@ impl App {
         ui.horizontal(|ui| {
             search_field(ui, &mut st.query, "Search apps", 240.0);
             ui.add_space(6.0);
-            for (f, t) in [(Filter::All, "All"), (Filter::Unused, "Unused 90+ days"), (Filter::Largest, "Largest")] {
+            for (f, t) in [(Filter::All, "All"), (Filter::Unused, "Unused 90+ days"), (Filter::Largest, "Largest"), (Filter::Updates, "Updates")] {
                 if chip(ui, st.filter == f, t) {
                     st.filter = f;
                 }
@@ -655,12 +865,22 @@ impl App {
             });
         });
         ui.add_space(12.0);
+        if self.uninstall.filter == Filter::Updates {
+            self.updates_view(ui);
+            return;
+        }
+        self.uninstall.refresh_live();
+        if !self.uninstall.open.is_empty() {
+            ui.ctx().request_repaint_after(Duration::from_secs(3));
+        }
+        let st = &mut self.uninstall;
 
         let mut act = None;
         let mut remove_orphans = false;
         let busy_del = self.del_total > 0;
         let deleting = &self.deleting;
         let thumbs = &mut self.thumbs;
+        let history = self.usage.clone();
         egui::ScrollArea::vertical().id_salt("uninstall").auto_shrink([false; 2]).show(ui, |ui| {
             card(ui, |ui| {
                 if ids.is_empty() {
@@ -737,6 +957,7 @@ impl App {
                                 ui.label(RichText::new("No leftover files found").small().color(DIM));
                             });
                         }
+                        usage_section(ui, &history.of(&a.name), st.live.get(&a.path));
                     }
                     if k + 1 < ids.len() {
                         ui.separator();
